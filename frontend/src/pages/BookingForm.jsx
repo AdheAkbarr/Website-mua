@@ -105,13 +105,40 @@ const BookingForm = () => {
 
   // Handler auto-update harga total ketika jumlah pax berubah
   const handlePaxChange = (paxVal) => {
-    const pax = parseInt(paxVal) || 1;
+    // Izinkan string kosong saat user sedang mengetik
+    if (paxVal === '' || paxVal === null) {
+      setJumlahOrang('');
+      return;
+    }
+    const pax = parseInt(paxVal);
+    if (isNaN(pax) || pax < 1) {
+      setJumlahOrang(1);
+      if (paketId) {
+        const selectedPkg = packages.find((p) => p.id === parseInt(paketId));
+        if (selectedPkg) setHargaTotal(selectedPkg.harga_dasar * 1);
+      }
+      return;
+    }
     setJumlahOrang(pax);
     if (paketId) {
       const selectedPkg = packages.find((p) => p.id === parseInt(paketId));
       if (selectedPkg) {
         setHargaTotal(selectedPkg.harga_dasar * pax);
       }
+    }
+  };
+
+  // Handler tombol stepper − dan +
+  const handlePaxStep = (delta) => {
+    const current = parseInt(jumlahOrang) || 1;
+    const next = Math.max(1, current + delta);
+    handlePaxChange(next);
+  };
+
+  // Ketika input pax kehilangan fokus, pastikan nilainya valid
+  const handlePaxBlur = () => {
+    if (jumlahOrang === '' || parseInt(jumlahOrang) < 1) {
+      handlePaxChange(1);
     }
   };
 
@@ -290,18 +317,42 @@ const BookingForm = () => {
               {errors.jamAcara && <p className="text-[10px] text-red-500 mt-0.5">{errors.jamAcara}</p>}
             </div>
 
-            {/* Jumlah Orang */}
+            {/* Jumlah Orang - Stepper mobile-friendly */}
             <div className="space-y-1">
               <label className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wide block">
                 Jumlah Orang (Pax) *
               </label>
-              <input
-                type="number"
-                min="1"
-                value={jumlahOrang}
-                onChange={(e) => handlePaxChange(e.target.value)}
-                className={`w-full bg-rose-50/10 dark:bg-gray-900 border ${errors.jumlahOrang ? 'border-red-400 focus:ring-red-400' : 'border-gray-200 dark:border-gray-700 focus:ring-rose-500'} rounded-xl py-2.5 px-3 text-xs text-gray-800 dark:text-white focus:outline-none focus:ring-1`}
-              />
+              <div className={`flex items-center border ${errors.jumlahOrang ? 'border-red-400' : 'border-gray-200 dark:border-gray-700'} rounded-xl overflow-hidden bg-rose-50/10 dark:bg-gray-900`}>
+                {/* Tombol Kurang */}
+                <button
+                  type="button"
+                  onClick={() => handlePaxStep(-1)}
+                  className="flex-shrink-0 w-11 h-10 flex items-center justify-center text-rose-500 hover:bg-rose-50 dark:hover:bg-gray-700 active:bg-rose-100 dark:active:bg-gray-600 transition-colors text-lg font-bold select-none touch-manipulation"
+                  aria-label="Kurangi pax"
+                >
+                  −
+                </button>
+                {/* Input Angka */}
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  value={jumlahOrang}
+                  onChange={(e) => handlePaxChange(e.target.value.replace(/[^0-9]/g, ''))}
+                  onBlur={handlePaxBlur}
+                  className="flex-1 min-w-0 text-center bg-transparent py-2.5 text-sm font-bold text-gray-800 dark:text-white focus:outline-none"
+                  aria-label="Jumlah pax"
+                />
+                {/* Tombol Tambah */}
+                <button
+                  type="button"
+                  onClick={() => handlePaxStep(1)}
+                  className="flex-shrink-0 w-11 h-10 flex items-center justify-center text-rose-500 hover:bg-rose-50 dark:hover:bg-gray-700 active:bg-rose-100 dark:active:bg-gray-600 transition-colors text-lg font-bold select-none touch-manipulation"
+                  aria-label="Tambah pax"
+                >
+                  +
+                </button>
+              </div>
               {errors.jumlahOrang && <p className="text-[10px] text-red-500 mt-0.5">{errors.jumlahOrang}</p>}
             </div>
 
