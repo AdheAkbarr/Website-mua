@@ -1,16 +1,16 @@
 // Nama file: routes/bookings.js
 // Deskripsi: Route Express untuk CRUD Booking, update status, riwayat reminder, dan status log
+// PERUBAHAN: Diubah dari synchronous better-sqlite3 ke async @libsql/client (Turso)
 
 const express = require('express');
 const router = express.Router();
-const db = require('../db');
+const { db } = require('../db');
 const authMiddleware = require('../middleware/auth');
 
-// Gunakan auth middleware untuk semua endpoint booking
 router.use(authMiddleware);
 
 // GET /api/bookings -> List booking dengan search, filter, sort, pagination
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
   try {
     const { status, bulan, search, sort, order, page, limit } = req.query;
 
@@ -21,19 +21,16 @@ router.get('/', (req, res) => {
     let conditions = [];
     let params = [];
 
-    // Filter status
     if (status && status !== 'all') {
       conditions.push('b.status = ?');
       params.push(status);
     }
 
-    // Filter bulan (Format: YYYY-MM)
     if (bulan) {
       conditions.push("strftime('%Y-%m', b.tanggal_acara) = ?");
       params.push(bulan);
     }
 
-    // Search nama client / kode booking
     if (search) {
       conditions.push('(b.nama_client LIKE ? OR b.kode_booking LIKE ?)');
       params.push(`%${search}%`, `%${search}%`);
@@ -42,12 +39,9 @@ router.get('/', (req, res) => {
     const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
     // Hitung total data untuk pagination
-    const countSql = `
-      SELECT COUNT(*) as count 
-      FROM bookings b 
-      ${whereClause}
-    `;
-    const totalCount = db.prepare(countSql).get(...params).count;
+    const countSql = `SELECT COUNT(*) as count FROM bookings b ${whereClause}`;
+    const countResult = await db.execute({ sql: countSql, args: params });
+    const totalCount = Number(countResult.rows[0].count);
 
     // Sorting
     let orderBy = 'ORDER BY b.tanggal_acara ASC, b.jam_acara ASC';
@@ -58,7 +52,6 @@ router.get('/', (req, res) => {
       orderBy = `ORDER BY ${sortField} ${sortOrder}`;
     }
 
-    // Query data
     const querySql = `
       SELECT b.*, p.nama_paket, p.harga_dasar as paket_harga_dasar
       FROM bookings b
@@ -68,8 +61,8 @@ router.get('/', (req, res) => {
       LIMIT ? OFFSET ?
     `;
 
-    const queryParams = [...params, limitNum, offset];
-    const bookings = db.prepare(querySql).all(...queryParams);
+    const queryResult = await db.execute({ sql: querySql, args: [...params, limitNum, offset] });
+    const bookings = queryResult.rows;
 
     const totalPages = Math.ceil(totalCount / limitNum);
 
@@ -89,39 +82,39 @@ router.get('/', (req, res) => {
 });
 
 // GET /api/bookings/:id -> Detail satu booking
-router.get('/:id', (req, res) => {
+router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
-    const booking = db.prepare(`
-      SELECT b.*, p.nama_paket, p.deskripsi as paket_deskripsi, p.harga_dasar as paket_harga_dasar
-      FROM bookings b
-      LEFT JOIN packages p ON b.paket_id = p.id
-      WHERE b.id = ?
-    `).get(id);
+    const bookingResult = await db.execute({
+      sql: `
+        SELECT b.*, p.nama_paket, p.deskripsi as paket_deskripsi, p.harga_dasar as paket_harga_dasar
+        FROM bookings b
+        LEFT JOIN packages p ON b.paket_id = p.id
+        WHERE b.id = ?
+      `,
+      args: [id],
+    });
 
+    const booking = bookingResult.rows[0];
     if (!booking) {
       return res.status(404).json({ error: 'Booking tidak ditemukan.' });
     }
 
-    // Ambil log status
-    const logs = db.prepare(`
-      SELECT * FROM status_log 
-      WHERE booking_id = ? 
-      ORDER BY changed_at DESC
-    `).all(id);
+    const logsResult = await db.execute({
+      sql: `SELECT * FROM status_log WHERE booking_id = ? ORDER BY changed_at DESC`,
+      args: [id],
+    });
 
-    // Ambil log reminder
-    const reminders = db.prepare(`
-      SELECT * FROM reminder_log 
-      WHERE booking_id = ? 
-      ORDER BY sent_at DESC
-    `).all(id);
+    const remindersResult = await db.execute({
+      sql: `SELECT * FROM reminder_log WHERE booking_id = ? ORDER BY sent_at DESC`,
+      args: [id],
+    });
 
     return res.status(200).json({
       booking,
-      statusLogs: logs,
-      reminderLogs: reminders
+      statusLogs: logsResult.rows,
+      reminderLogs: remindersResult.rows,
     });
 
   } catch (error) {
@@ -130,90 +123,62 @@ router.get('/:id', (req, res) => {
 });
 
 // POST /api/bookings -> Tambah booking baru
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   try {
     const {
-      nama_client,
-      no_hp,
-      tanggal_acara,
-      jam_acara,
-      lokasi,
-      jumlah_orang,
-      paket_id,
-      catatan,
-      harga_total,
-      dp_jumlah,
-      dp_status,
-      deadline_konfirmasi,
-      status
+      nama_client, no_hp, tanggal_acara, jam_acara, lokasi,
+      jumlah_orang, paket_id, catatan, harga_total,
+      dp_jumlah, dp_status, deadline_konfirmasi, status
     } = req.body;
 
-    // Validasi input wajib
     if (!nama_client || !no_hp || !tanggal_acara || !jam_acara || !lokasi || !paket_id) {
       return res.status(400).json({ error: 'Mohon isi semua field wajib.' });
     }
 
-    // Auto-generate kode booking: MUA-YYYYMMDD-XXXX
     const todayStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const randSuffix = Math.floor(1000 + Math.random() * 9000); // 4 digit angka acak
+    const randSuffix = Math.floor(1000 + Math.random() * 9000);
     const kode_booking = `MUA-${todayStr}-${randSuffix}`;
 
-    // Jalankan transaksi
-    const insertBooking = db.transaction(() => {
-      const final_status = status || 'pending';
-      let final_dp_status = 'belum';
-      let final_dp_jumlah = 0;
-      const parsed_harga_total = parseFloat(harga_total) || 0;
+    const final_status = status || 'pending';
+    let final_dp_status = 'belum';
+    let final_dp_jumlah = 0;
+    const parsed_harga_total = parseFloat(harga_total) || 0;
 
-      if (final_status === 'confirmed') {
-        final_dp_status = 'lunas';
-        final_dp_jumlah = parsed_harga_total / 2;
-      } else if (final_status === 'done') {
-        final_dp_status = 'lunas';
-        final_dp_jumlah = parsed_harga_total;
-      }
+    if (final_status === 'confirmed') {
+      final_dp_status = 'lunas';
+      final_dp_jumlah = parsed_harga_total / 2;
+    } else if (final_status === 'done') {
+      final_dp_status = 'lunas';
+      final_dp_jumlah = parsed_harga_total;
+    }
 
-      const result = db.prepare(`
+    const result = await db.execute({
+      sql: `
         INSERT INTO bookings (
-          kode_booking, nama_client, no_hp, tanggal_acara, jam_acara, 
-          lokasi, jumlah_orang, paket_id, catatan, harga_total, 
+          kode_booking, nama_client, no_hp, tanggal_acara, jam_acara,
+          lokasi, jumlah_orang, paket_id, catatan, harga_total,
           dp_jumlah, dp_status, deadline_konfirmasi, status
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        kode_booking,
-        nama_client,
-        no_hp,
-        tanggal_acara,
-        jam_acara,
-        lokasi,
-        parseInt(jumlah_orang) || 1,
-        paket_id,
-        catatan || '',
-        parsed_harga_total,
-        final_dp_jumlah,
-        final_dp_status,
-        deadline_konfirmasi || null,
-        final_status
-      );
-
-
-      const bookingId = result.lastInsertRowid;
-
-      // Catat log status awal
-      db.prepare(`
-        INSERT INTO status_log (booking_id, status_lama, status_baru, catatan)
-        VALUES (?, NULL, 'pending', 'Booking baru berhasil dibuat.')
-      `).run(bookingId);
-
-      return bookingId;
+      `,
+      args: [
+        kode_booking, nama_client, no_hp, tanggal_acara, jam_acara,
+        lokasi, parseInt(jumlah_orang) || 1, paket_id, catatan || '',
+        parsed_harga_total, final_dp_jumlah, final_dp_status,
+        deadline_konfirmasi || null, final_status,
+      ],
     });
 
-    const newId = insertBooking();
+    const newId = Number(result.lastInsertRowid);
+
+    await db.execute({
+      sql: `INSERT INTO status_log (booking_id, status_lama, status_baru, catatan) VALUES (?, NULL, 'pending', 'Booking baru berhasil dibuat.')`,
+      args: [newId],
+    });
 
     return res.status(201).json({
       message: 'Booking baru berhasil dibuat.',
       bookingId: newId,
-      kode_booking
+      kode_booking,
     });
 
   } catch (error) {
@@ -222,82 +187,61 @@ router.post('/', (req, res) => {
 });
 
 // PUT /api/bookings/:id -> Update detail booking
-router.put('/:id', (req, res) => {
+router.put('/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const {
-      nama_client,
-      no_hp,
-      tanggal_acara,
-      jam_acara,
-      lokasi,
-      jumlah_orang,
-      paket_id,
-      catatan,
-      harga_total,
-      dp_jumlah,
-      dp_status,
-      deadline_konfirmasi,
-      status
+      nama_client, no_hp, tanggal_acara, jam_acara, lokasi,
+      jumlah_orang, paket_id, catatan, harga_total,
+      dp_jumlah, dp_status, deadline_konfirmasi, status
     } = req.body;
 
     if (!nama_client || !no_hp || !tanggal_acara || !jam_acara || !lokasi || !paket_id) {
       return res.status(400).json({ error: 'Mohon isi semua field wajib.' });
     }
 
-    const currentBooking = db.prepare('SELECT status FROM bookings WHERE id = ?').get(id);
+    const currentResult = await db.execute({ sql: 'SELECT status FROM bookings WHERE id = ?', args: [id] });
+    const currentBooking = currentResult.rows[0];
     if (!currentBooking) {
       return res.status(404).json({ error: 'Booking tidak ditemukan.' });
     }
 
-    const updateTx = db.transaction(() => {
-      const final_status = status || 'pending';
-      let final_dp_status = 'belum';
-      let final_dp_jumlah = 0;
-      const parsed_harga_total = parseFloat(harga_total) || 0;
+    const final_status = status || 'pending';
+    let final_dp_status = 'belum';
+    let final_dp_jumlah = 0;
+    const parsed_harga_total = parseFloat(harga_total) || 0;
 
-      if (final_status === 'confirmed') {
-        final_dp_status = 'lunas';
-        final_dp_jumlah = parsed_harga_total / 2;
-      } else if (final_status === 'done') {
-        final_dp_status = 'lunas';
-        final_dp_jumlah = parsed_harga_total;
-      }
+    if (final_status === 'confirmed') {
+      final_dp_status = 'lunas';
+      final_dp_jumlah = parsed_harga_total / 2;
+    } else if (final_status === 'done') {
+      final_dp_status = 'lunas';
+      final_dp_jumlah = parsed_harga_total;
+    }
 
-      db.prepare(`
+    await db.execute({
+      sql: `
         UPDATE bookings SET
-          nama_client = ?, no_hp = ?, tanggal_acara = ?, jam_acara = ?, 
-          lokasi = ?, jumlah_orang = ?, paket_id = ?, catatan = ?, 
+          nama_client = ?, no_hp = ?, tanggal_acara = ?, jam_acara = ?,
+          lokasi = ?, jumlah_orang = ?, paket_id = ?, catatan = ?,
           harga_total = ?, dp_jumlah = ?, dp_status = ?, deadline_konfirmasi = ?,
           status = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
-      `).run(
-        nama_client,
-        no_hp,
-        tanggal_acara,
-        jam_acara,
-        lokasi,
-        parseInt(jumlah_orang) || 1,
-        paket_id,
-        catatan || '',
-        parsed_harga_total,
-        final_dp_jumlah,
-        final_dp_status,
-        deadline_konfirmasi || null,
-        final_status,
-        id
-      );
-
-      // Jika status berubah, catat ke log
-      if (final_status && final_status !== currentBooking.status) {
-        db.prepare(`
-          INSERT INTO status_log (booking_id, status_lama, status_baru, catatan)
-          VALUES (?, ?, ?, 'Diubah secara manual saat update booking.')
-        `).run(id, currentBooking.status, final_status);
-      }
+      `,
+      args: [
+        nama_client, no_hp, tanggal_acara, jam_acara,
+        lokasi, parseInt(jumlah_orang) || 1, paket_id, catatan || '',
+        parsed_harga_total, final_dp_jumlah, final_dp_status,
+        deadline_konfirmasi || null, final_status, id,
+      ],
     });
 
-    updateTx();
+    if (final_status && final_status !== currentBooking.status) {
+      await db.execute({
+        sql: `INSERT INTO status_log (booking_id, status_lama, status_baru, catatan) VALUES (?, ?, ?, 'Diubah secara manual saat update booking.')`,
+        args: [id, currentBooking.status, final_status],
+      });
+    }
 
     return res.status(200).json({ message: 'Booking berhasil diperbarui.' });
 
@@ -307,26 +251,18 @@ router.put('/:id', (req, res) => {
 });
 
 // DELETE /api/bookings/:id -> Hapus booking
-router.delete('/:id', (req, res) => {
+router.delete('/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
-    const exist = db.prepare('SELECT id FROM bookings WHERE id = ?').get(id);
-    if (!exist) {
+    const existResult = await db.execute({ sql: 'SELECT id FROM bookings WHERE id = ?', args: [id] });
+    if (existResult.rows.length === 0) {
       return res.status(404).json({ error: 'Booking tidak ditemukan.' });
     }
 
-    // Transaksi hapus
-    const deleteTx = db.transaction(() => {
-      // Hapus status log terkait
-      db.prepare('DELETE FROM status_log WHERE booking_id = ?').run(id);
-      // Hapus reminder log terkait
-      db.prepare('DELETE FROM reminder_log WHERE booking_id = ?').run(id);
-      // Hapus booking utama
-      db.prepare('DELETE FROM bookings WHERE id = ?').run(id);
-    });
-
-    deleteTx();
+    await db.execute({ sql: 'DELETE FROM status_log WHERE booking_id = ?', args: [id] });
+    await db.execute({ sql: 'DELETE FROM reminder_log WHERE booking_id = ?', args: [id] });
+    await db.execute({ sql: 'DELETE FROM bookings WHERE id = ?', args: [id] });
 
     return res.status(200).json({ message: 'Booking berhasil dihapus.' });
 
@@ -336,7 +272,7 @@ router.delete('/:id', (req, res) => {
 });
 
 // PATCH /api/bookings/:id/status -> Ubah status booking saja
-router.patch('/:id/status', (req, res) => {
+router.patch('/:id/status', async (req, res) => {
   try {
     const { id } = req.params;
     const { status, catatan } = req.body;
@@ -345,41 +281,38 @@ router.patch('/:id/status', (req, res) => {
       return res.status(400).json({ error: 'Status baru wajib disertakan.' });
     }
 
-    const currentBooking = db.prepare('SELECT status, harga_total FROM bookings WHERE id = ?').get(id);
+    const currentResult = await db.execute({ sql: 'SELECT status, harga_total FROM bookings WHERE id = ?', args: [id] });
+    const currentBooking = currentResult.rows[0];
     if (!currentBooking) {
       return res.status(404).json({ error: 'Booking tidak ditemukan.' });
     }
 
-    const statusTx = db.transaction(() => {
-      let final_dp_status = 'belum';
-      let final_dp_jumlah = 0;
-      const parsed_harga_total = currentBooking.harga_total || 0;
+    let final_dp_status = 'belum';
+    let final_dp_jumlah = 0;
+    const parsed_harga_total = currentBooking.harga_total || 0;
 
-      if (status === 'confirmed') {
-        final_dp_status = 'lunas';
-        final_dp_jumlah = parsed_harga_total / 2;
-      } else if (status === 'done') {
-        final_dp_status = 'lunas';
-        final_dp_jumlah = parsed_harga_total;
-      }
+    if (status === 'confirmed') {
+      final_dp_status = 'lunas';
+      final_dp_jumlah = parsed_harga_total / 2;
+    } else if (status === 'done') {
+      final_dp_status = 'lunas';
+      final_dp_jumlah = parsed_harga_total;
+    }
 
-      db.prepare(`
-        UPDATE bookings SET status = ?, dp_status = ?, dp_jumlah = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).run(status, final_dp_status, final_dp_jumlah, id);
-
-      db.prepare(`
-        INSERT INTO status_log (booking_id, status_lama, status_baru, catatan)
-        VALUES (?, ?, ?, ?)
-      `).run(id, currentBooking.status, status, catatan || 'Status diubah via Quick Action.');
+    await db.execute({
+      sql: `UPDATE bookings SET status = ?, dp_status = ?, dp_jumlah = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      args: [status, final_dp_status, final_dp_jumlah, id],
     });
 
-    statusTx();
+    await db.execute({
+      sql: `INSERT INTO status_log (booking_id, status_lama, status_baru, catatan) VALUES (?, ?, ?, ?)`,
+      args: [id, currentBooking.status, status, catatan || 'Status diubah via Quick Action.'],
+    });
 
     return res.status(200).json({
       message: 'Status booking berhasil diperbarui.',
       status_lama: currentBooking.status,
-      status_baru: status
+      status_baru: status,
     });
 
   } catch (error) {
@@ -387,24 +320,22 @@ router.patch('/:id/status', (req, res) => {
   }
 });
 
-// GET /api/bookings/:id/reminder -> Riwayat reminder booking ini
-router.get('/:id/reminder', (req, res) => {
+// GET /api/bookings/:id/reminder -> Riwayat reminder booking
+router.get('/:id/reminder', async (req, res) => {
   try {
     const { id } = req.params;
-    const reminders = db.prepare(`
-      SELECT * FROM reminder_log 
-      WHERE booking_id = ? 
-      ORDER BY sent_at DESC
-    `).all(id);
-
-    return res.status(200).json(reminders);
+    const result = await db.execute({
+      sql: `SELECT * FROM reminder_log WHERE booking_id = ? ORDER BY sent_at DESC`,
+      args: [id],
+    });
+    return res.status(200).json(result.rows);
   } catch (error) {
     return res.status(500).json({ error: 'Gagal mengambil riwayat reminder: ' + error.message });
   }
 });
 
-// POST /api/bookings/:id/reminder-manual -> Mencatat log reminder yang dikirim secara manual
-router.post('/:id/reminder-manual', (req, res) => {
+// POST /api/bookings/:id/reminder-manual -> Catat log reminder manual
+router.post('/:id/reminder-manual', async (req, res) => {
   try {
     const { id } = req.params;
     const { tipe, pesan } = req.body;
@@ -413,10 +344,10 @@ router.post('/:id/reminder-manual', (req, res) => {
       return res.status(400).json({ error: 'Tipe dan pesan wajib diisi.' });
     }
 
-    db.prepare(`
-      INSERT INTO reminder_log (booking_id, tipe, pesan)
-      VALUES (?, ?, ?)
-    `).run(id, tipe, pesan);
+    await db.execute({
+      sql: `INSERT INTO reminder_log (booking_id, tipe, pesan) VALUES (?, ?, ?)`,
+      args: [id, tipe, pesan],
+    });
 
     return res.status(200).json({ message: 'Log reminder manual berhasil disimpan.' });
   } catch (error) {

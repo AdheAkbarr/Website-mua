@@ -1,30 +1,21 @@
 // Nama file: server.js
-// Deskripsi: Setup server Express, routing API, scheduler, dan penanganan error
+// Deskripsi: Setup server Express untuk Vercel Serverless Functions
+// PERUBAHAN: Export app (bukan .listen()) agar bisa berjalan di Vercel
 
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
-const { initScheduler } = require('./scheduler');
+const { initDatabase } = require('./db');
 
 // Inisialisasi Express
 const app = express();
-const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors({
-  origin: '*', // Di production sebaiknya diganti dengan domain frontend tertentu
+  origin: '*',
   credentials: true
 }));
 app.use(express.json());
-
-// Log request (opsional untuk development)
-if (process.env.NODE_ENV === 'development') {
-  app.use((req, res, next) => {
-    // console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.url}`);
-    next();
-  });
-}
 
 // Routes
 const authRouter = require('./routes/auth');
@@ -56,10 +47,18 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Start Server
-app.listen(PORT, () => {
-  // console.log(`[Server] Berjalan di port http://localhost:${PORT}`);
-  
-  // Jalankan scheduler reminder otomatis
-  initScheduler();
+// Inisialisasi database saat module dimuat (Vercel cold start)
+initDatabase().catch(err => {
+  console.error('[DB Init Error]:', err.message);
 });
+
+// Untuk development lokal: jalankan server biasa
+if (process.env.NODE_ENV !== 'production' && require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`[Server] Berjalan di http://localhost:${PORT}`);
+  });
+}
+
+// Export untuk Vercel Serverless
+module.exports = app;
